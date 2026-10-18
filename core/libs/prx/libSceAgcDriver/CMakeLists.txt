@@ -291,6 +291,10 @@ target_link_libraries(libSceAgcDriver PRIVATE
         jpeg_turbo
         ${CMAKE_DL_LIBS}
 )
+if(APS5_DEBUG_INFO)
+    target_compile_options(libSceAgcDriver PRIVATE -g)
+    target_compile_options(shader_recompiler_agc_driver PRIVATE -g)
+endif()
 if(APS5_ENABLE_TRACY)
     target_link_libraries(libSceAgcDriver PUBLIC TracyClient)
 endif()
