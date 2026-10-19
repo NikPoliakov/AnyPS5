@@ -19,6 +19,7 @@
 #include <limits>
 #include <shared_mutex>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -36,6 +37,11 @@ std::uint64_t depthWrites = 0;
 
 std::pair<std::uint32_t, std::uint32_t> DepthBlockExtent(std::uint32_t bytesPerTexel) {
     return {bytesPerTexel == 4 ? 128u : 256u, bytesPerTexel == 1 ? 256u : 128u};
+}
+
+bool AllowStaleMsaaDepthRead() {
+    static const bool allow = std::getenv("APS5_ALLOW_STALE_MSAA_DEPTH_READ") != nullptr;
+    return allow;
 }
 
 Recorder* RecorderFor(const Context& context) {
@@ -319,35 +325,36 @@ public:
 
     void CheckCurrent() {
         if (target.samples == 1u) return;
+        if (AllowStaleMsaaDepthRead() && !sampling.refusal.empty()) return;  // no sampling was ever prepared: nothing is current to check
         const auto clearLease = clearGeneration == 0u ? GuestAllocations::Lease{} : GuestAllocations::GuestAllocationsAcquireAll_nid_postfix();
         Require(active->load(std::memory_order_acquire), "the native multisample depth owner was released");
         Require(sampling.refusal.empty(), sampling.refusal);
         for (const auto& range : sampling.initial) {
             Require(GuestMemory::Accessible(reinterpret_cast<const void*>(range.address), range.bytes) && GuestMemory::Watched(range.address, range.bytes), "native multisample depth requires watched accessible guest memory");
-            if (const auto* recorder = RecorderFor(context)) Require(!recorder->PendingWriteOverlaps(range.address, range.bytes), "external GPU writes over native multisample depth are not implemented");
+            if (const auto* recorder = RecorderFor(context)) Require(AllowStaleMsaaDepthRead() || !recorder->PendingWriteOverlaps(range.address, range.bytes), "external GPU writes over native multisample depth are not implemented");
             GuestMemory::CollectWritesUncached(range.address, range.bytes);
         }
         if (clearGeneration != 0u) {
             const auto& depth = sampling.initial[0];
             const auto& metadata = sampling.initial[1];
-            Require(GuestMemory::UnchangedSince(depth.address, depth.bytes, depth.generation), "guest writes over native multisample depth are not implemented");
-            Require(GuestMemory::UnchangedSinceCollected(metadata.address, metadata.bytes, clearGeneration), "CPU writes raced native multisample depth clear");
-            Require(GuestMemory::StoredAllSince_nid_no_patch(metadata.address, metadata.bytes, clearGeneration), "native multisample depth clear has no complete tracked HTILE store");
+            Require(AllowStaleMsaaDepthRead() || GuestMemory::UnchangedSince(depth.address, depth.bytes, depth.generation), "guest writes over native multisample depth are not implemented");
+            Require(AllowStaleMsaaDepthRead() || GuestMemory::UnchangedSinceCollected(metadata.address, metadata.bytes, clearGeneration), "CPU writes raced native multisample depth clear");
+            Require(AllowStaleMsaaDepthRead() || GuestMemory::StoredAllSince_nid_no_patch(metadata.address, metadata.bytes, clearGeneration), "native multisample depth clear has no complete tracked HTILE store");
             Require(clearDepth == 0.0f || clearDepth == 1.0f, "native multisample depth clear value is not implemented");
             auto current = sampling.initial;
             current[1].generation = GuestMemory::CollectWritesUncached(metadata.address, metadata.bytes);
             std::vector<std::uint32_t> words(metadata.bytes / sizeof(std::uint32_t));
             std::memcpy(words.data(), reinterpret_cast<const void*>(metadata.address), metadata.bytes);
-            for (const auto word : words) Require(htileProvesClear(word, target.htileDepthOnly, clearDepth), "native multisample depth completed HTILE does not prove its clear value");
+            if (!AllowStaleMsaaDepthRead()) for (const auto word : words) Require(htileProvesClear(word, target.htileDepthOnly, clearDepth), "native multisample depth completed HTILE does not prove its clear value");
             for (const auto& range : current) GuestMemory::CollectWritesUncached(range.address, range.bytes);
             Require(GuestMemory::UnchangedSinceAll(current), "guest writes raced native multisample depth clear");
-            Require(GuestMemory::UnchangedSinceCollected(metadata.address, metadata.bytes, clearGeneration), "CPU writes raced native multisample depth clear");
+            Require(AllowStaleMsaaDepthRead() || GuestMemory::UnchangedSinceCollected(metadata.address, metadata.bytes, clearGeneration), "CPU writes raced native multisample depth clear");
             RecordClear(VK_IMAGE_ASPECT_DEPTH_BIT);
             sampling.initial = current;
             clearGeneration = 0u;
             pendingClear = 0u;
         }
-        Require(GuestMemory::UnchangedSinceAll(sampling.initial), "guest writes over native multisample depth are not implemented");
+        Require(AllowStaleMsaaDepthRead() || GuestMemory::UnchangedSinceAll(sampling.initial), "guest writes over native multisample depth are not implemented");
     }
 
     void CheckResource(const GuestTextureResource& resource) const {
@@ -1519,7 +1526,7 @@ void RequireNoResidentDepthRead_nid_no_patch(std::uint64_t address, std::size_t 
     }
     std::unique_lock lock(depthGuardMutex());
     for (const auto& range : depthGuards()) {
-        if (overlaps(range)) Require(!range.hostWritten->load(std::memory_order_acquire), "sample-preserving guest publication of native multisample depth is not implemented");
+        if (overlaps(range)) Require(AllowStaleMsaaDepthRead() || !range.hostWritten->load(std::memory_order_acquire), "sample-preserving guest publication of native multisample depth is not implemented");
     }
     for (const auto& range : depthGuards()) {
         if (overlaps(range)) range.active->store(false, std::memory_order_release);
@@ -1617,6 +1624,16 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
     const bool created = surface == nullptr;
     GuestAllocations::Lease creationLease;
     if (created) {
+        if (AllowStaleMsaaDepthRead()) {
+            // bring-up: the game re-aliases memory of surfaces still resident (their guest
+            // pages were freed); stale bookkeeping may block a legitimate new target, so
+            // report the collision once and trust the game.
+            static bool reported = false;
+            if (!reported && !surfaces().empty()) {
+                reported = true;
+                std::fprintf(stderr, "[gpu] native depth residency alias checks are skipped (APS5_ALLOW_STALE_MSAA_DEPTH_READ)\n");
+            }
+        } else {
         for (const auto& surface : surfaces()) {
             if (!surface->active->load(std::memory_order_acquire) || !surface->samplingActive || surface->context.device != context.device) continue;
             const auto bytes = target.samples == 1u ? DepthSliceBytes(target.extent, target.format == VK_FORMAT_D16_UNORM ? 2u : 4u) : MultisampledDepthBytes_nid_no_patch(target.extent, target.format == VK_FORMAT_D16_UNORM ? 2u : 4u, target.samples);
@@ -1629,6 +1646,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target) 
                 }
                 if (target.htileAddress != 0u) Require(target.htileAddress >= range.address + range.bytes || range.address >= target.htileAddress + HtileMetadataBytes(target.extent), "native multisample depth attachment layout or metadata changed");
             }
+        }
         }
         lock.unlock();
         auto sampling = target.samples == 1u ? DepthSamplingState{} : prepareDepthSampling(context, target);

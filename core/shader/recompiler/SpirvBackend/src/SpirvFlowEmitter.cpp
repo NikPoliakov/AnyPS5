@@ -95,7 +95,7 @@ void EmitReturnTerminator(SpirvValueEmitContext& ctx) {
     }
     EmitKillIfPixelValidMaskInactive(state);
     if (state.quadPixelUncovered != 0u) EmitKillIfBoolFalse(state, Unary(state, spv::OpLogicalNot, TypeBool(state), state.quadPixelUncovered));
-    if (state.stencilReplay) {
+    if (state.stencilReplay && state.stencilRefVariable != 0u) {
         const auto value = state.module.AllocateId();
         state.module.AddFunction(spv::OpLoad, TypeI32(state), value, state.stencilRefVariable);
         const auto reference = Unary(state, spv::OpBitcast, TypeU32(state), value);

@@ -2,6 +2,8 @@
 #include "Optimization/MaskedSelectEliminator.hpp"
 #include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
 #include <algorithm>
+#include <cstdlib>
+#include <fstream>
 #include <functional>
 #include <iterator>
 #include <map>
@@ -605,7 +607,13 @@ std::vector<std::uint32_t> StencilReferenceValues(const IrProgram& program, std:
             if (info.kind != ExportTargetKind::MrtZ || (info.en & 2u) == 0u) continue;
             std::set<const IrValue*> visiting;
             const auto values = Values(program, instruction->Argument(0), visiting, 0u, 1u, instruction->Argument(1));
-            if (!values) return {};
+            if (!values) {
+                if (const char* dump = std::getenv("APS5_DUMP_STENCIL_IR"); dump != nullptr) {
+                    std::ofstream file(dump);
+                    file << ProgramToString(program);
+                }
+                return {};
+            }
             for (const auto value : *values) result.insert((value >> shift) & 0xffu);
             if (result.size() > 16u) return {};
         }
